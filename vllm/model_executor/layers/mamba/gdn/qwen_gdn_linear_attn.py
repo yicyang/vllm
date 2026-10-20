@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import inspect
 import os
 from typing import Literal
 
@@ -90,9 +91,65 @@ MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
+def _aiter_gdn_prefill_importable() -> bool:
+    try:
+        from aiter.ops.triton.gated_delta_net.gated_delta_rule import (  # noqa: F401
+            chunk_gated_delta_rule_opt_vk,
+        )
+    except ImportError:
+        return False
+    return True
+
+
+# Largest decode batch (after CUDA-graph padding) routed to AITER FlyDSL; above
+# it vLLM's packed Triton kernel is as fast or faster (measured on MI355X).
+FLYDSL_GDN_DECODE_MAX_BATCH = 16
+
+
+def _load_aiter_flydsl_gdr_decode():
+    """AITER's FlyDSL GDN decode, or None if disabled or too old.
+
+    min_valid_index support is required: vLLM pads CUDA-graph batches with the
+    reserved state slot 0, which the kernel must skip.
+    """
+    if not (
+        current_platform.is_rocm()
+        and rocm_aiter_ops.is_enabled()
+        and envs.VLLM_ROCM_USE_AITER_GDN_FLYDSL_DECODE
+    ):
+        return None
+    try:
+        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+    except ImportError:
+        return None
+    if "min_valid_index" not in inspect.signature(flydsl_gdr_decode).parameters:
+        logger.info_once(
+            "AITER FlyDSL GDN decode disabled: installed AITER lacks min_valid_index."
+        )
+        return None
+    logger.info_once("Using AITER FlyDSL GDN decode for small non-spec batches.")
+    return flydsl_gdr_decode
+
+
+def _load_aiter_flydsl_gdr_mtp():
+    """AITER's FlyDSL GDN MTP-verify kernel, or None if disabled/unavailable."""
+    if not (
+        current_platform.is_rocm()
+        and rocm_aiter_ops.is_enabled()
+        and envs.VLLM_ROCM_USE_AITER_GDN_FLYDSL_MTP
+    ):
+        return None
+    try:
+        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_mtp
+    except ImportError:
+        return None
+    logger.info_once("Using AITER FlyDSL GDN kernel for MTP verify.")
+    return flydsl_gdr_mtp
+
+
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "aiter"]]:
     """Resolve GDN prefill backend.
 
     FlashInfer's GDN prefill kernel is chosen when:
@@ -105,6 +162,11 @@ def _resolve_gdn_prefill_backend(
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
     * Blackwell (SM10.x) with ``head_k_dim == 128``;
+
+    AITER ``chunk_gated_delta_rule_opt_vk`` is chosen when:
+    * "aiter" is requested; (opt-in only)
+    * ROCm with AITER enabled and the kernel importable;
+    * ``head_k_dim == head_v_dim == 128``.
     """
     additional_config = vllm_config.additional_config
     backend_cfg = (
@@ -114,12 +176,26 @@ def _resolve_gdn_prefill_backend(
     )
     backend = str(backend_cfg).strip().lower()
 
-    if not current_platform.is_cuda():
-        return backend, "triton"
-
     head_k_dim = getattr(
         vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
     )
+
+    if backend == "aiter":
+        head_v_dim = getattr(
+            vllm_config.model_config.hf_text_config, "linear_value_head_dim", None
+        )
+        if (
+            current_platform.is_rocm()
+            and rocm_aiter_ops.is_enabled()
+            and _aiter_gdn_prefill_importable()
+            and head_k_dim == 128
+            and head_v_dim == 128
+        ):
+            return backend, "aiter"
+        return backend, "triton"
+
+    if not current_platform.is_cuda():
+        return backend, "triton"
 
     supports_flashinfer = False
     supports_cutedsl = False
@@ -162,6 +238,7 @@ def _log_gdn_backend_decision(
     chosen = {
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
+        "aiter": "AITER",
         "triton": "Triton/FLA",
     }[active_backend]
     logger.info_once(
@@ -236,7 +313,7 @@ class ChunkGatedDeltaRule(CustomOp):
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
 
-        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
+        if backend in ("flashinfer", "cutedsl", "aiter") and active_backend != backend:
             logger.warning_once(
                 "GDN prefill backend '%s' is selected but cannot use this "
                 "kernel on the current platform. Falling back to Triton/FLA.",
@@ -248,6 +325,13 @@ class ChunkGatedDeltaRule(CustomOp):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
+        elif active_backend == "aiter":
+            from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
+                chunk_gated_delta_rule_opt_vk,
+            )
+
+            self._aiter_chunk_gated_delta_rule = chunk_gated_delta_rule_opt_vk
+            self._forward_method = self.forward_aiter
         else:
             self._forward_method = self.forward_native
 
@@ -265,6 +349,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        seq_lens_cpu: list[int] | None = None,
     ):
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
@@ -276,6 +361,43 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if core_attn_out is not None:
+            o_flat = o.squeeze(0).reshape(-1)
+            co_flat = core_attn_out.reshape(-1)
+            co_flat[: o_flat.numel()].copy_(o_flat)
+        return o, final_state
+
+    def forward_aiter(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+        seq_lens_cpu: list[int] | None = None,
+    ):
+        # Same [N, HV, V, K] state layout as FLA. seq_lens_cpu lets AITER build
+        # its chunk metadata on the host instead of syncing on cu_seqlens.
+        o, final_state = self._aiter_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            state_dtype=initial_state.dtype,
+            seq_lens_cpu=seq_lens_cpu,
         )
         if core_attn_out is not None:
             o_flat = o.squeeze(0).reshape(-1)
@@ -297,6 +419,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        seq_lens_cpu: list[int] | None = None,
     ):
         return fla_chunk_gated_delta_rule(
             q=q,
@@ -327,6 +450,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        seq_lens_cpu: list[int] | None = None,
     ):
         from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
             chunk_gated_delta_rule_cutedsl,
@@ -499,6 +623,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+        )
+        self._flydsl_gdr_decode = (
+            _load_aiter_flydsl_gdr_decode()
+            if self.head_k_dim == 128 and self.head_v_dim == 128
+            else None
+        )
+        self._flydsl_gdr_mtp = (
+            _load_aiter_flydsl_gdr_mtp()
+            if self.head_k_dim == 128 and self.head_v_dim == 128
+            else None
         )
         self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
         if self.gdn_decode_kernel == "cuda" and current_platform.is_cuda_alike():
@@ -1393,7 +1527,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        # The FlyDSL MTP kernel needs the same draft length for every sequence
+        # and reads q/k/v straight from the conv output (no rearrange copy).
+        use_flydsl_mtp = (
+            spec_sequence_masks is not None
+            and self._flydsl_gdr_mtp is not None
+            and spec_state_indices_tensor is not None
+            and attn_metadata.num_spec_decode_tokens
+            == attn_metadata.num_spec_decodes * spec_state_indices_tensor.size(-1)
+        )
+        if use_flydsl_mtp:
+            query_spec = key_spec = value_spec = None
+        else:
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(
+                mixed_qkv_spec
+            )
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
@@ -1456,7 +1604,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if use_flydsl_mtp:
+            core_attn_out_spec = self._flydsl_mtp_verify(
+                mixed_qkv_spec,
+                a_spec,
+                b_spec,
+                ssm_state,
+                spec_state_indices_tensor,
+                num_accepted_tokens,
+                attn_metadata.num_spec_decodes,
+            )
+            last_recurrent_state = ssm_state
+        elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1531,6 +1690,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                seq_lens_cpu=attn_metadata.prefill_seq_lens_cpu,
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
@@ -1645,6 +1805,40 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out.reshape(-1),
         )
 
+    def _flydsl_mtp_verify(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_seqs: int,
+    ) -> torch.Tensor:
+        """MTP-verify recurrence with AITER FlyDSL; returns [1, N*T, HV, V]."""
+        n, t = num_seqs, state_indices.size(-1)
+        hk = self.num_k_heads // self.tp_size
+        hv = self.num_v_heads // self.tp_size
+        dk, dv = self.head_k_dim, self.head_v_dim
+        qkv = mixed_qkv[: n * t]
+        out = torch.empty(n, t, hv, dv, dtype=qkv.dtype, device=qkv.device)
+        self._flydsl_gdr_mtp(
+            qkv[:, : hk * dk].view(n, t, hk, dk),
+            qkv[:, hk * dk : 2 * hk * dk].view(n, t, hk, dk),
+            qkv[:, 2 * hk * dk :].view(n, t, hv, dv),
+            a[: n * t].view(n, t, hv),
+            b[: n * t].view(n, t, hv),
+            self.dt_bias,
+            self.A_log,
+            state_indices[:n],
+            num_accepted_tokens[:n],
+            ssm_state,
+            out,
+            use_qk_l2norm=True,
+            min_valid_index=1,  # slot 0 is the null / CUDA-graph padding block
+        )
+        return out.view(1, n * t, hv, dv)
+
     def _forward_core_decode_non_spec(
         self,
         mixed_qkv: torch.Tensor,
@@ -1685,6 +1879,31 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             validate_data=False,
         )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        if (
+            self._flydsl_gdr_decode is not None
+            and num_actual_tokens <= FLYDSL_GDN_DECODE_MAX_BATCH
+        ):
+            n = num_actual_tokens
+            hk = self.num_k_heads // self.tp_size
+            hv = self.num_v_heads // self.tp_size
+            dk, dv = self.head_k_dim, self.head_v_dim
+            qkv = mixed_qkv_non_spec
+            self._flydsl_gdr_decode(
+                qkv[:, : hk * dk].view(n, 1, hk, dk),
+                qkv[:, hk * dk : 2 * hk * dk].view(n, 1, hk, dk),
+                qkv[:, 2 * hk * dk :].view(n, 1, hv, dv),
+                a.view(n, 1, hv),
+                b.view(n, 1, hv),
+                self.dt_bias,
+                self.A_log,
+                non_spec_state_indices_tensor[:n],  # type: ignore[index]
+                ssm_state,
+                out_buf,
+                use_qk_l2norm=True,
+                need_shuffle_state=False,
+                min_valid_index=1,  # slot 0 is the CUDA-graph padding slot
+            )
+            return
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
