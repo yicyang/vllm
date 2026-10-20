@@ -131,6 +131,22 @@ def _load_aiter_flydsl_gdr_decode():
     return flydsl_gdr_decode
 
 
+def _load_aiter_flydsl_gdr_mtp():
+    """AITER's FlyDSL GDN MTP-verify kernel, or None if disabled/unavailable."""
+    if not (
+        current_platform.is_rocm()
+        and rocm_aiter_ops.is_enabled()
+        and envs.VLLM_ROCM_USE_AITER_GDN_FLYDSL_MTP
+    ):
+        return None
+    try:
+        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_mtp
+    except ImportError:
+        return None
+    logger.info_once("Using AITER FlyDSL GDN kernel for MTP verify.")
+    return flydsl_gdr_mtp
+
+
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
 ) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "aiter"]]:
@@ -610,6 +626,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         self._flydsl_gdr_decode = (
             _load_aiter_flydsl_gdr_decode()
+            if self.head_k_dim == 128 and self.head_v_dim == 128
+            else None
+        )
+        self._flydsl_gdr_mtp = (
+            _load_aiter_flydsl_gdr_mtp()
             if self.head_k_dim == 128 and self.head_v_dim == 128
             else None
         )
@@ -1506,7 +1527,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        # The FlyDSL MTP kernel needs the same draft length for every sequence
+        # and reads q/k/v straight from the conv output (no rearrange copy).
+        use_flydsl_mtp = (
+            spec_sequence_masks is not None
+            and self._flydsl_gdr_mtp is not None
+            and spec_state_indices_tensor is not None
+            and attn_metadata.num_spec_decode_tokens
+            == attn_metadata.num_spec_decodes * spec_state_indices_tensor.size(-1)
+        )
+        if use_flydsl_mtp:
+            query_spec = key_spec = value_spec = None
+        else:
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(
+                mixed_qkv_spec
+            )
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
@@ -1569,7 +1604,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if use_flydsl_mtp:
+            core_attn_out_spec = self._flydsl_mtp_verify(
+                mixed_qkv_spec,
+                a_spec,
+                b_spec,
+                ssm_state,
+                spec_state_indices_tensor,
+                num_accepted_tokens,
+                attn_metadata.num_spec_decodes,
+            )
+            last_recurrent_state = ssm_state
+        elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1758,6 +1804,40 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             use_qk_l2norm_in_kernel=True,
             core_attn_out=core_attn_out.reshape(-1),
         )
+
+    def _flydsl_mtp_verify(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_seqs: int,
+    ) -> torch.Tensor:
+        """MTP-verify recurrence with AITER FlyDSL; returns [1, N*T, HV, V]."""
+        n, t = num_seqs, state_indices.size(-1)
+        hk = self.num_k_heads // self.tp_size
+        hv = self.num_v_heads // self.tp_size
+        dk, dv = self.head_k_dim, self.head_v_dim
+        qkv = mixed_qkv[: n * t]
+        out = torch.empty(n, t, hv, dv, dtype=qkv.dtype, device=qkv.device)
+        self._flydsl_gdr_mtp(
+            qkv[:, : hk * dk].view(n, t, hk, dk),
+            qkv[:, hk * dk : 2 * hk * dk].view(n, t, hk, dk),
+            qkv[:, 2 * hk * dk :].view(n, t, hv, dv),
+            a[: n * t].view(n, t, hv),
+            b[: n * t].view(n, t, hv),
+            self.dt_bias,
+            self.A_log,
+            state_indices[:n],
+            num_accepted_tokens[:n],
+            ssm_state,
+            out,
+            use_qk_l2norm=True,
+            min_valid_index=1,  # slot 0 is the null / CUDA-graph padding block
+        )
+        return out.view(1, n * t, hv, dv)
 
     def _forward_core_decode_non_spec(
         self,
