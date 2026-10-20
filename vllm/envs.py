@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
+    VLLM_ROCM_USE_AITER_GDN_FLYDSL_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
@@ -1202,6 +1203,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
+    ),
+    # ROCm: run small-batch non-spec GDN decode with AITER's FlyDSL kernel
+    # (needs VLLM_ROCM_USE_AITER=1 and an AITER whose flydsl_gdr_decode accepts
+    # min_valid_index).
+    "VLLM_ROCM_USE_AITER_GDN_FLYDSL_DECODE": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_GDN_FLYDSL_DECODE", "True").lower()
+        in ("true", "1")
     ),
     # Select the GDN MTP decode implementation. "cuda" uses the fused decode
     # kernel where supported and falls back to "triton" otherwise; setting it

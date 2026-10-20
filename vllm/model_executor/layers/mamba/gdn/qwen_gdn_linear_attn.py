@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import inspect
 import os
 from typing import Literal
 
@@ -98,6 +99,36 @@ def _aiter_gdn_prefill_importable() -> bool:
     except ImportError:
         return False
     return True
+
+
+# Largest decode batch (after CUDA-graph padding) routed to AITER FlyDSL; above
+# it vLLM's packed Triton kernel is as fast or faster (measured on MI355X).
+FLYDSL_GDN_DECODE_MAX_BATCH = 16
+
+
+def _load_aiter_flydsl_gdr_decode():
+    """AITER's FlyDSL GDN decode, or None if disabled or too old.
+
+    min_valid_index support is required: vLLM pads CUDA-graph batches with the
+    reserved state slot 0, which the kernel must skip.
+    """
+    if not (
+        current_platform.is_rocm()
+        and rocm_aiter_ops.is_enabled()
+        and envs.VLLM_ROCM_USE_AITER_GDN_FLYDSL_DECODE
+    ):
+        return None
+    try:
+        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+    except ImportError:
+        return None
+    if "min_valid_index" not in inspect.signature(flydsl_gdr_decode).parameters:
+        logger.info_once(
+            "AITER FlyDSL GDN decode disabled: installed AITER lacks min_valid_index."
+        )
+        return None
+    logger.info_once("Using AITER FlyDSL GDN decode for small non-spec batches.")
+    return flydsl_gdr_decode
 
 
 def _resolve_gdn_prefill_backend(
@@ -576,6 +607,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+        )
+        self._flydsl_gdr_decode = (
+            _load_aiter_flydsl_gdr_decode()
+            if self.head_k_dim == 128 and self.head_v_dim == 128
+            else None
         )
         self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
         if self.gdn_decode_kernel == "cuda" and current_platform.is_cuda_alike():
@@ -1763,6 +1799,31 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             validate_data=False,
         )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        if (
+            self._flydsl_gdr_decode is not None
+            and num_actual_tokens <= FLYDSL_GDN_DECODE_MAX_BATCH
+        ):
+            n = num_actual_tokens
+            hk = self.num_k_heads // self.tp_size
+            hv = self.num_v_heads // self.tp_size
+            dk, dv = self.head_k_dim, self.head_v_dim
+            qkv = mixed_qkv_non_spec
+            self._flydsl_gdr_decode(
+                qkv[:, : hk * dk].view(n, 1, hk, dk),
+                qkv[:, hk * dk : 2 * hk * dk].view(n, 1, hk, dk),
+                qkv[:, 2 * hk * dk :].view(n, 1, hv, dv),
+                a.view(n, 1, hv),
+                b.view(n, 1, hv),
+                self.dt_bias,
+                self.A_log,
+                non_spec_state_indices_tensor[:n],  # type: ignore[index]
+                ssm_state,
+                out_buf,
+                use_qk_l2norm=True,
+                need_shuffle_state=False,
+                min_valid_index=1,  # slot 0 is the CUDA-graph padding slot
+            )
+            return
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
