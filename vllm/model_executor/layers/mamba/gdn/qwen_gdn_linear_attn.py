@@ -302,6 +302,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        seq_lens_cpu: list[int] | None = None,
     ):
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
@@ -334,11 +335,10 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        seq_lens_cpu: list[int] | None = None,
     ):
-        # The AITER kernel uses the same [N, HV, V, K] state layout as FLA.
-        # Its hidden-state step (K5) is fastest in Triton for a single long
-        # sequence and in FlyDSL for several sequences (measured on MI355X).
-        multi_seq = cu_seqlens is not None and cu_seqlens.shape[0] > 2
+        # Same [N, HV, V, K] state layout as FLA. seq_lens_cpu lets AITER build
+        # its chunk metadata on the host instead of syncing on cu_seqlens.
         o, final_state = self._aiter_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -349,8 +349,8 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
-            use_chunk_flydsl=multi_seq,
             state_dtype=initial_state.dtype,
+            seq_lens_cpu=seq_lens_cpu,
         )
         if core_attn_out is not None:
             o_flat = o.squeeze(0).reshape(-1)
@@ -372,6 +372,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        seq_lens_cpu: list[int] | None = None,
     ):
         return fla_chunk_gated_delta_rule(
             q=q,
@@ -402,6 +403,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        seq_lens_cpu: list[int] | None = None,
     ):
         from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
             chunk_gated_delta_rule_cutedsl,
@@ -1606,6 +1608,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                seq_lens_cpu=attn_metadata.prefill_seq_lens_cpu,
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)

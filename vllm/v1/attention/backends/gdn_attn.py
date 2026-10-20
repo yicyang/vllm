@@ -70,6 +70,9 @@ class GDNAttentionMetadata:
     chunk_offsets: torch.Tensor | None = None
     # Chunk-kernel inputs for prefill
     prefill_query_start_loc: torch.Tensor | None = None
+    # Host copy of the prefill sequence lengths, for kernels that would
+    # otherwise read prefill_query_start_loc back from the device.
+    prefill_seq_lens_cpu: list[int] | None = None
     prefill_state_indices: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
 
@@ -368,6 +371,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
         prefill_query_start_loc: torch.Tensor | None = None
+        prefill_seq_lens_cpu: list[int] | None = None
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
         if num_prefills > 0:
@@ -396,6 +400,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_query_start_loc_cpu,
                 query_start_loc.device,
             )
+            prefill_seq_lens_cpu = torch.diff(prefill_query_start_loc_cpu).tolist()
 
         if num_prefills > 0:
             context_lens_tensor = m.compute_num_computed_tokens()
@@ -506,6 +511,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             prefill_query_start_loc=prefill_query_start_loc,
+            prefill_seq_lens_cpu=prefill_seq_lens_cpu,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
             spec_query_start_loc=spec_query_start_loc,

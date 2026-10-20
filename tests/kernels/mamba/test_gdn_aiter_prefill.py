@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """AITER chunk_gated_delta_rule_opt_vk must match FLA for the inputs that
-ChunkGatedDeltaRule.forward_aiter passes (gdn_prefill_backend="aiter")."""
+ChunkGatedDeltaRule.forward_aiter passes (gdn_prefill_backend="aiter").
+seq_lens_cpu needs an AITER build with host-side chunk metadata."""
 
 import pytest
 import torch
@@ -23,8 +24,9 @@ from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 @pytest.mark.parametrize("seq_lens", [[300], [4096], [1000, 77, 2050, 64]])
 @pytest.mark.parametrize("num_k_heads,num_v_heads", [(16, 32), (16, 48)])
 @pytest.mark.parametrize("use_chunk_flydsl", [False, True])
+@pytest.mark.parametrize("pass_seq_lens_cpu", [False, True])
 def test_aiter_opt_vk_matches_fla(
-    seq_lens, num_k_heads, num_v_heads, use_chunk_flydsl
+    seq_lens, num_k_heads, num_v_heads, use_chunk_flydsl, pass_seq_lens_cpu
 ):
     torch.set_default_device("cuda")
     set_random_seed(0)
@@ -51,10 +53,12 @@ def test_aiter_opt_vk_matches_fla(
         use_qk_l2norm_in_kernel=False,
     )
     o_ref, h_ref = chunk_gated_delta_rule(initial_state=h0.clone(), **common)
+    extra = {"seq_lens_cpu": seq_lens} if pass_seq_lens_cpu else {}
     o, h = aiter_gdr.chunk_gated_delta_rule_opt_vk(
         initial_state=h0.clone(),
         use_chunk_flydsl=use_chunk_flydsl,
         state_dtype=h0.dtype,
+        **extra,
         **common,
     )
     torch.testing.assert_close(o.float(), o_ref.float(), atol=1e-2, rtol=1e-2)
